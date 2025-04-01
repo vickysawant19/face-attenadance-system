@@ -25,42 +25,6 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
     dbResponseCacheRef.current = dbResponseCache;
   }, [dbResponseCache]);
 
-  // Helper: Given a detection and a list of documents, find a matching document
-  const matchWithDocuments = (detection, documents) => {
-    const threshold = 0.4;
-    let matchFound = null;
-    for (const doc of documents) {
-      if (!doc.descriptor || !Array.isArray(doc.descriptor)) continue;
-      const storedDescriptors = doc.descriptor
-        .map((desc) => {
-          try {
-            return Object.values(JSON.parse(desc));
-          } catch (e) {
-            console.error("Error parsing descriptor:", e);
-            return null;
-          }
-        })
-        .filter((d) => d);
-      for (const storedDesc of storedDescriptors) {
-        if (detection.descriptor.length !== storedDesc.length) continue;
-        const distance = faceapi.euclideanDistance(
-          detection.descriptor,
-          storedDesc
-        );
-        if (distance < threshold) {
-          matchFound = {
-            name: doc.name,
-            distance,
-            document: doc, // Store the entire document for reference
-          };
-          break;
-        }
-      }
-      if (matchFound) break;
-    }
-    return matchFound;
-  };
-
   // Helper function to compare face descriptors
   const compareDescriptors = (descriptor1, descriptor2) => {
     if (
@@ -394,6 +358,42 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
       // Reset the API call flag once the call is complete
       apiCallInProgressRef.current = false;
     }
+  };
+
+  // Helper: Given a detection and a list of documents, find a matching document
+  const matchWithDocuments = (detection, documents) => {
+    const threshold = 0.4;
+    let matchFound = null;
+    for (const doc of documents) {
+      if (!doc.descriptor || !Array.isArray(doc.descriptor)) continue;
+      const storedDescriptors = doc.descriptor
+        .map((desc) => {
+          try {
+            return Object.values(JSON.parse(desc));
+          } catch (e) {
+            console.error("Error parsing descriptor:", e);
+            return null;
+          }
+        })
+        .filter((d) => d);
+      for (const storedDesc of storedDescriptors) {
+        if (detection.descriptor.length !== storedDesc.length) continue;
+        const distance = faceapi.euclideanDistance(
+          detection.descriptor,
+          storedDesc
+        );
+        if (distance < threshold) {
+          matchFound = {
+            name: doc.name,
+            distance,
+            document: doc, // Store the entire document for reference
+          };
+          break;
+        }
+      }
+      if (matchFound) break;
+    }
+    return matchFound;
   };
 
   // Helper function to find the best descriptor match from cached documents
