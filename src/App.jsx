@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import FaceAttendance from "./FaceAttendance";
+import FaceAttendance from "./face-attendance/FaceAttendance";
 
 function App() {
   const [count, setCount] = useState(0);
