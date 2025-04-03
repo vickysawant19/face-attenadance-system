@@ -8,13 +8,15 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
   const [resultMessage, setResultMessage] = useState("");
   // Cache for detected faces
   const [faceCache, setFaceCache] = useState(new Map());
-  // New cache for database responses
+  // Cache for database responses
   const [dbResponseCache, setDbResponseCache] = useState(new Map());
   // Ref to track if an API call is currently in progress
   const apiCallInProgressRef = useRef(false);
   // Use refs to access the latest cache values without re-rendering
   const faceCacheRef = useRef(new Map());
   const dbResponseCacheRef = useRef(new Map());
+  // Track total API calls
+  const [apiCallCount, setApiCallCount] = useState(0);
 
   // Update the refs whenever cache states change
   useEffect(() => {
@@ -25,36 +27,52 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
     dbResponseCacheRef.current = dbResponseCache;
   }, [dbResponseCache]);
 
-  // Helper function to compare face descriptors
-  const compareDescriptors = (descriptor1, descriptor2) => {
-    if (
-      !descriptor1 ||
-      !descriptor2 ||
-      descriptor1.length !== descriptor2.length
-    ) {
-      return 1.0; // Return a value greater than any threshold if descriptors can't be compared
-    }
-    return faceapi.euclideanDistance(descriptor1, descriptor2);
+  // Standardized function to create face cache entry
+  const createFaceCacheEntry = (hash, isMatched, matchInfo = null) => {
+    return {
+      detectedHash: hash,
+      isMatched: isMatched,
+      attendanceMarked: false,
+      message: isMatched
+        ? {
+            name: matchInfo.name,
+            distance: matchInfo.distance,
+            matchSource: matchInfo.source || "unknown",
+            document: matchInfo.document || null,
+          }
+        : { name: "Unknown", distance: 1 },
+    };
   };
 
-  // Check if face is in DB response cache
+  // Check if face is in DB response cache - optimized to return all matching documents at once
   const checkDbCache = (hashArray) => {
     const currentDbCache = dbResponseCacheRef.current;
     console.log("Checking DB cache with hash chunks:", hashArray);
 
-    // Check if any hash chunk is present in the DB cache
-    for (const hash of hashArray) {
-      if (currentDbCache.has(hash)) {
-        console.log("DB cache hit for hash chunk:", hash);
-        return currentDbCache.get(hash);
+    // Collect all matching documents
+    const matchingDocuments = new Set();
+
+    for (const dbHash of currentDbCache.keys()) {
+      for (const hash of hashArray) {
+        if (dbHash.includes(hash)) {
+          const documents = currentDbCache.get(dbHash);
+          if (Array.isArray(documents)) {
+            documents.forEach((doc) => matchingDocuments.add(doc));
+          }
+        }
       }
     }
 
-    console.log("No match found in DB cache");
-    return null;
+    if (matchingDocuments.size === 0) {
+      console.log("No match found in DB cache");
+      return null;
+    }
+
+    console.log(`Found ${matchingDocuments.size} unique documents in DB cache`);
+    return Array.from(matchingDocuments);
   };
 
-  // Store documents in DB cache
+  // Store documents in DB cache - optimized to avoid duplicates
   const storeInDbCache = (documents) => {
     if (!documents || !Array.isArray(documents) || documents.length === 0)
       return;
@@ -66,7 +84,13 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
       if (doc.hash && Array.isArray(doc.hash)) {
         // For each hash in the document, store the entire document list
         doc.hash.forEach((hashKey) => {
-          currentDbCache.set(hashKey, documents);
+          const existingDocs = currentDbCache.get(hashKey) || [];
+          // Add document if not already in the list
+          if (
+            !existingDocs.some((existingDoc) => existingDoc.$id === doc.$id)
+          ) {
+            currentDbCache.set(hashKey, [...existingDocs, doc]);
+          }
         });
         console.log(
           `Cached document "${doc.name}" with ${doc.hash.length} hash entries`
@@ -79,88 +103,64 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
     dbResponseCacheRef.current = currentDbCache;
   };
 
-  // This function attempts a match, first checking the local face cache,
-  // then the DB response cache, and finally calling the API if needed.
+  // This function attempts a match, first checking the face cache,
+  // then DB cache, and finally calling the API if needed.
   const attemptMatch = async (detection) => {
+    if (!detection || !detection.descriptor) {
+      console.error("Invalid detection object");
+      return null;
+    }
+
     const detectedHash = generateBinaryHash(detection.descriptor);
     // Create an array of hash chunks (3 chunks of 20 bits each)
     const hashArray = (detectedHash.match(/.{1,20}/g) || []).slice(0, 3);
+    const currentFaceCache = faceCacheRef.current;
 
     // STEP 1: Check if the face is already in the face cache
-    const currentFaceCache = faceCacheRef.current;
     console.log("Total keys in face cache:", currentFaceCache.size);
 
-    let cacheFace = null;
+    // Try to find an exact hash match first (most efficient)
+    if (currentFaceCache.has(detectedHash)) {
+      const cachedEntry = currentFaceCache.get(detectedHash);
+      console.log("Exact hash match found in face cache");
 
-    // Check if the face is already present in the face cache
-    for (const faceHash of currentFaceCache.keys()) {
-      if (hashArray.some((hash) => faceHash.includes(hash))) {
-        console.log("Face hash match found in face cache");
-        cacheFace = currentFaceCache.get(faceHash);
-
-        // If the entry is marked as not matched, perform a descriptor comparison
-        if (cacheFace && !cacheFace.isMatched && cacheFace.descriptor) {
-          console.log(
-            "Found cache face but isMatched=false, checking descriptors"
-          );
-
-          // Check if this new face can match with cached documents
-          const bestDocMatch = findBestDescriptorMatch(
-            detection.descriptor,
-            cacheFace
-          );
-
-          if (bestDocMatch) {
-            console.log(
-              "Secondary descriptor match found with:",
-              bestDocMatch.name
-            );
-
-            // Update the cache entry with the match information
-            const updatedData = {
-              ...cacheFace,
-              isMatched: true,
-              message: {
-                name: bestDocMatch.name,
-                distance: bestDocMatch.distance,
-                document: bestDocMatch.document,
-                matchSource: "secondary_descriptor_check",
-              },
-            };
-
-            // Update both the cache map and the state
-            const newCache = new Map(currentFaceCache);
-            newCache.set(faceHash, updatedData);
-
-            // Also add an entry for the new hash
-            newCache.set(detectedHash, updatedData);
-
-            // Update state and ref
-            setFaceCache(newCache);
-            faceCacheRef.current = newCache;
-
-            return updatedData.message;
-          }
-        }
-
-        break;
+      // If already matched, return the cached result
+      if (cachedEntry.isMatched) {
+        return cachedEntry.message;
+      } else {
+        // If not matched, check with DB cache again
+        console.log("Face previously unmatched, checking DB cache again");
+        // Continue to DB cache checking (don't return here)
       }
     }
 
-    if (cacheFace) {
-      console.log(
-        "Returning cached face data for:",
-        cacheFace.message?.name || "Unknown"
-      );
-      return cacheFace.message;
+    // Try to find a partial hash match
+    let partialMatchFound = false;
+    for (const [cacheHash, cacheEntry] of currentFaceCache.entries()) {
+      if (hashArray.some((hash) => cacheHash.includes(hash))) {
+        console.log("Partial hash match found in face cache");
+
+        // If already matched, return the cached result
+        if (cacheEntry.isMatched) {
+          partialMatchFound = true;
+          return cacheEntry.message;
+        } else {
+          // If not matched, we'll continue to DB checking
+          partialMatchFound = true;
+          console.log("Face previously unmatched, continuing to DB check");
+          break;
+        }
+      }
     }
 
-    console.log("No match in face cache, checking DB cache");
+    if (!partialMatchFound) {
+      console.log("No match in face cache, checking DB cache");
+    }
 
     // STEP 2: Check if we have matching documents in the DB cache
     const cachedDocuments = checkDbCache(hashArray);
 
-    if (cachedDocuments) {
+    if (cachedDocuments && cachedDocuments.length > 0) {
       console.log(
         `Found ${cachedDocuments.length} documents in DB cache, attempting to match`
       );
@@ -169,51 +169,17 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
       if (matchFound) {
         console.log("Match found in DB cache for:", matchFound.name);
 
-        // Store the match in face cache
-        const newFaceCache = new Map(currentFaceCache);
-        const data = {
-          detection,
-          detectedHash,
-          isMatched: true,
-          attendanceMarked: false,
-          message: {
-            name: matchFound.name,
-            distance: matchFound.distance,
-            document: matchFound.document,
-            matchSource: "db_cache",
-          },
-          descriptor: detection.descriptor,
+        // Create and store the match in face cache
+        const matchInfo = {
+          name: matchFound.name,
+          distance: matchFound.distance,
+          document: matchFound.document,
+          source: "db_cache",
         };
-
-        newFaceCache.set(detectedHash, data);
-        setFaceCache(newFaceCache);
-        faceCacheRef.current = newFaceCache;
-
-        return matchFound;
+        return matchInfo;
       } else {
         console.log("Documents found in DB cache but no face match");
-
-        // Store the detected face with the documents for potential future matching
-        const newFaceCache = new Map(currentFaceCache);
-        const data = {
-          detection,
-          detectedHash,
-          isMatched: false,
-          attendanceMarked: false,
-          message: {
-            name: "Unknown",
-            distance: 0,
-            possibleMatches: cachedDocuments.map((doc) => doc.name),
-          },
-          descriptor: detection.descriptor,
-          documents: cachedDocuments,
-        };
-
-        newFaceCache.set(detectedHash, data);
-        setFaceCache(newFaceCache);
-        faceCacheRef.current = newFaceCache;
-
-        return { name: "Unknown", distance: 0 };
+        return { name: "Unknown", distance: 1 };
       }
     }
 
@@ -233,12 +199,15 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
     // Build query from hash chunks
     const queries = hashArray.map((chunk) => Query.contains("hash", chunk));
     try {
+      // Increment API call counter
+      setApiCallCount((prevCount) => prevCount + 1);
+
       const response = await appwriteService.getMatches([
         Query.or(queries),
         Query.limit(10), // Increased limit to get more potential matches
       ]);
 
-      if (response.total) {
+      if (response.total > 0 && Array.isArray(response.documents)) {
         // Store all documents in DB cache for future use
         storeInDbCache(response.documents);
 
@@ -247,105 +216,43 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
         if (matchFound) {
           console.log("Match found from API for:", matchFound.name);
 
-          // Store the match in face cache
-          const newFaceCache = new Map(currentFaceCache);
-          const data = {
-            detection,
-            detectedHash,
-            isMatched: true,
-            attendanceMarked: false,
-            message: {
-              name: matchFound.name,
-              distance: matchFound.distance,
-              document: matchFound.document,
-              matchSource: "api_call",
-            },
-            descriptor: detection.descriptor,
+          // Create and store match
+          const matchInfo = {
+            name: matchFound.name,
+            distance: matchFound.distance,
+            document: matchFound.document,
+            source: "api_call",
           };
 
-          newFaceCache.set(detectedHash, data);
+          const newEntry = createFaceCacheEntry(detectedHash, true, matchInfo);
 
-          // Also store all document hashes from the response in face cache
-          response.documents.forEach((doc) => {
-            if (doc.hash && Array.isArray(doc.hash)) {
-              doc.hash.forEach((hashKey) => {
-                if (
-                  !newFaceCache.has(hashKey) ||
-                  doc.name === matchFound.name
-                ) {
-                  newFaceCache.set(hashKey, {
-                    ...data,
-                    documentHash: hashKey,
-                  });
-                }
-              });
-            }
-          });
-
+          const newFaceCache = new Map(currentFaceCache);
+          newFaceCache.set(detectedHash, newEntry);
           setFaceCache(newFaceCache);
           faceCacheRef.current = newFaceCache;
 
-          return matchFound;
+          return matchInfo;
         } else {
           // No match was found despite getting documents from DB
           console.log("Documents found from API but no face match");
 
+          const newEntry = createFaceCacheEntry(detectedHash, false);
+
           const newFaceCache = new Map(currentFaceCache);
-          const data = {
-            detection,
-            detectedHash,
-            isMatched: false,
-            attendanceMarked: false,
-            message: {
-              name: "Unknown",
-              distance: 0,
-              possibleMatches: response.documents.map((doc) => doc.name),
-            },
-            descriptor: detection.descriptor,
-            documents: response.documents,
-          };
-
-          newFaceCache.set(detectedHash, data);
-
-          // Also store associations with all document hashes
-          response.documents.forEach((doc) => {
-            if (doc.hash && Array.isArray(doc.hash)) {
-              doc.hash.forEach((hashKey) => {
-                if (!newFaceCache.has(hashKey)) {
-                  newFaceCache.set(hashKey, {
-                    ...data,
-                    documentHash: hashKey,
-                    sourceName: doc.name,
-                  });
-                }
-              });
-            }
-          });
-
+          newFaceCache.set(detectedHash, newEntry);
           setFaceCache(newFaceCache);
           faceCacheRef.current = newFaceCache;
 
-          return {
-            name: "Unknown",
-            distance: 0,
-            possibleMatches: response.documents.map((doc) => doc.name),
-          };
+          return { name: "Unknown", distance: 0 };
         }
       } else {
         // No documents found in DB
         console.log("No documents found in database - storing as unknown");
 
-        const data = {
-          detection,
-          detectedHash,
-          isMatched: false,
-          attendanceMarked: false,
-          message: { name: "Unknown", distance: 0 },
-          descriptor: detection.descriptor,
-        };
+        const newEntry = createFaceCacheEntry(detectedHash, false);
 
         const newFaceCache = new Map(currentFaceCache);
-        newFaceCache.set(detectedHash, data);
+        newFaceCache.set(detectedHash, newEntry);
         setFaceCache(newFaceCache);
         faceCacheRef.current = newFaceCache;
 
@@ -360,12 +267,20 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
     }
   };
 
-  // Helper: Given a detection and a list of documents, find a matching document
+  // Helper: Given a detection and a list of documents, find the best matching document
   const matchWithDocuments = (detection, documents) => {
+    if (!detection || !detection.descriptor || !Array.isArray(documents)) {
+      console.error("Invalid input to matchWithDocuments");
+      return null;
+    }
+
     const threshold = 0.4;
-    let matchFound = null;
+    let bestMatch = null;
+    let bestDistance = threshold;
+
     for (const doc of documents) {
       if (!doc.descriptor || !Array.isArray(doc.descriptor)) continue;
+
       const storedDescriptors = doc.descriptor
         .map((desc) => {
           try {
@@ -376,63 +291,23 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
           }
         })
         .filter((d) => d);
+
       for (const storedDesc of storedDescriptors) {
         if (detection.descriptor.length !== storedDesc.length) continue;
+
         const distance = faceapi.euclideanDistance(
           detection.descriptor,
           storedDesc
         );
-        if (distance < threshold) {
-          matchFound = {
+
+        // Find the best (lowest distance) match
+        if (distance < bestDistance) {
+          bestMatch = {
             name: doc.name,
             distance,
             document: doc, // Store the entire document for reference
           };
-          break;
-        }
-      }
-      if (matchFound) break;
-    }
-    return matchFound;
-  };
-
-  // Helper function to find the best descriptor match from cached documents
-  const findBestDescriptorMatch = (descriptor, cachedFace) => {
-    const threshold = 0.4;
-    let bestMatch = null;
-    let lowestDistance = threshold;
-
-    // If no documents, we can't find a match
-    if (!cachedFace.documents || !Array.isArray(cachedFace.documents)) {
-      return null;
-    }
-
-    // Check against each document and its descriptors
-    for (const doc of cachedFace.documents) {
-      if (!doc.descriptor || !Array.isArray(doc.descriptor)) continue;
-
-      const docDescriptors = doc.descriptor
-        .map((desc) => {
-          try {
-            return Object.values(JSON.parse(desc));
-          } catch (e) {
-            console.error("Error parsing descriptor:", e);
-            return null;
-          }
-        })
-        .filter((d) => d);
-
-      for (const docDesc of docDescriptors) {
-        if (descriptor.length !== docDesc.length) continue;
-
-        const distance = faceapi.euclideanDistance(descriptor, docDesc);
-        if (distance < lowestDistance) {
-          lowestDistance = distance;
-          bestMatch = {
-            name: doc.name,
-            distance,
-            document: doc,
-          };
+          bestDistance = distance;
         }
       }
     }
@@ -440,11 +315,11 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
     return bestMatch;
   };
 
-  // Function to mark attendance (you can call this when needed)
+  // Function to mark attendance
   const markAttendance = (faceHash) => {
     if (faceCacheRef.current.has(faceHash)) {
       const newCache = new Map(faceCacheRef.current);
-      const faceData = newCache.get(faceHash);
+      const faceData = { ...newCache.get(faceHash) };
 
       // Update the attendance field
       faceData.attendanceMarked = true;
@@ -461,10 +336,10 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
 
   // Overlay logic: detect face and, if matched, draw a card with the student name.
   useEffect(() => {
-    let IntervalId;
+    let intervalId;
 
     // Update overlay every 500ms
-    IntervalId = setInterval(async () => {
+    intervalId = setInterval(async () => {
       await drawCanvas({
         webcamRef,
         canvasRef,
@@ -475,16 +350,19 @@ const MatchFaceMode = ({ faceapi, webcamRef, canvasRef }) => {
     }, 500);
 
     return () => {
-      clearInterval(IntervalId);
+      clearInterval(intervalId);
     };
-  }, [webcamRef, canvasRef, faceCache]); // Added faceCache as a dependency
+  }, [webcamRef, canvasRef, faceapi]); // Removed faceCache dependency to prevent extra re-renders
 
   return (
     <div className="controls match-face">
       <h2>Match Face</h2>
       {resultMessage && <p className="result-message">{resultMessage}</p>}
-      <h2>Face Cache: {faceCache.size}</h2>
-      <h2>DB Cache: {dbResponseCache.size}</h2>
+      <div className="stats">
+        <h3>Face Cache: {faceCache.size}</h3>
+        <h3>DB Cache: {dbResponseCache.size}</h3>
+        <h3>API Calls: {apiCallCount}</h3>
+      </div>
     </div>
   );
 };
